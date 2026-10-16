@@ -1,0 +1,19 @@
+.hud-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(14, 18, 26, 0.84);
+  color: #f1f5f9;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  backdrop-filter: blur(8px);
+  padding: 7px 12px;
+  border-radius: 8px;
+  font-weight: 700;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.hud-btn:hover,
+.hud-btn:active {
+  border-color: #00f0ff;
+}
