@@ -1,437 +1,597 @@
-import React, { useRef, useEffect } from 'react';
-import { useFrame, useThree } from '@react-three/fiber';
-import * as THREE from 'three';
-import { useGameStore, controls, telemetry } from '../../store/useGameStore';
+import { useLayoutEffect } from 'react'
+import { useFrame, useThree } from '@react-three/fiber'
+import * as THREE from 'three'
+import { soundEngine } from '../../audio/SoundEngine'
+import { sendTelemetry, netBridge } from '../../network/useMultiplayer'
 import {
-  trackCurve,
-  trackSamples,
-  findClosestTrackSample,
+  BASE_MAX_SPEED,
+  CAM_MODES,
+  PALETTE,
+  handles,
+  inputState,
+  intents,
+  remoteTarget,
+  sim,
+  telemetry,
+  useGameStore,
+} from '../../store/useGameStore'
+import {
+  CURB_INSET,
+  TRACK_LENGTH,
   TRACK_WIDTH,
-  TRACK_SEGMENTS,
-  TOTAL_TRACK_LENGTH,
-} from '../../utils/trackSpline';
-import KartModel from './KartModel';
-import { sfx } from '../../audio/SoundEngine';
+  WALL_INSET,
+  closestSampleIndex,
+  miniPts,
+  poseTangent,
+  slopeFromTangentY,
+  trackSamples,
+  writePose,
+} from '../../utils/trackSpline'
+import { sparkHex, updateKart } from './KartModel'
 
-// Pre-allocated scratch vectors (Zero Garbage Collection in 60fps loop)
-const _camDesired = new THREE.Vector3();
-const _camLook = new THREE.Vector3();
-const _remoteVec = new THREE.Vector3();
-const _up = new THREE.Vector3(0, 1, 0);
-const _binormal = new THREE.Vector3();
+const UP = new THREE.Vector3(0, 1, 0)
+const pull = new THREE.Vector2()
+const camDesired = new THREE.Vector3()
+const lookTarget = new THREE.Vector3()
+const remoteVec = new THREE.Vector3()
+const skidWorld = new THREE.Vector3()
+const skidDummy = new THREE.Object3D()
+const skidColor = new THREE.Color()
 
-const BASE_MAX_SPEED = 48.0;
+const HALF = TRACK_WIDTH * 0.5
+const CURB_START = HALF - CURB_INSET
+const WALL_LIMIT = HALF - WALL_INSET
+const REAR_LATERAL = [ -1.2, 1.2 ]
 
-const AI_CONFIGS = [
-  { bodyColor: '#2ecc71', trimColor: '#f1c40f', lane: -3.2, skill: 0.99 },
-  { bodyColor: '#9b59b6', trimColor: '#00f0ff', lane: 3.2, skill: 0.96 },
-  { bodyColor: '#ff7f50', trimColor: '#ffffff', lane: -1.5, skill: 0.93 },
-];
+function frameAlpha(perFrameAt60, dt) {
+  return 1 - Math.pow(1 - perFrameAt60, dt * 60)
+}
 
-export default function RaceController({ sendTelemetry }) {
-  const { camera } = useThree();
+function fmtTime(sec) {
+  const minutes = Math.floor(sec / 60)
+  const seconds = (sec % 60).toFixed(1).padStart(4, '0')
+  return `${String(minutes).padStart(2, '0')}:${seconds}`
+}
 
-  const phase = useGameStore((s) => s.phase);
-  const laps = useGameStore((s) => s.laps);
-  const aiCount = useGameStore((s) => s.aiCount);
-  const aiDifficulty = useGameStore((s) => s.aiDifficulty);
-  const camIndex = useGameStore((s) => s.camIndex);
-  const netRole = useGameStore((s) => s.netRole);
-  const peerConnected = useGameStore((s) => s.peerConnected);
-  const resetTrigger = useGameStore((s) => s.resetTrigger);
-  const setPhase = useGameStore((s) => s.setPhase);
+function resetPlayer() {
+  const player = handles.player
+  if (!player?.root) return
+  const role = useGameStore.getState().netRole
+  const sample = trackSamples[0]
+  const lane = role === 'client' ? 2.4 : -2.4
+  player.root.position.copy(sample.pt).addScaledVector(sample.binormal, lane)
+  telemetry.heading = Math.atan2(sample.tangent.x, sample.tangent.z)
+  sim.camHeading = telemetry.heading
+  sim.camPitch = 0
+  telemetry.speed = 0
+  telemetry.slip = 0
+  telemetry.driftDir = 0
+  telemetry.driftCharge = 0
+  telemetry.boostTimer = 0
+  telemetry.lastU = 0
+  telemetry.u = sample.u
+  sim.hint = 0
+  player.root.rotation.y = telemetry.heading
+  if (player.visual) {
+    player.visual.rotation.x = 0
+    player.visual.rotation.z = 0
+  }
+  sim.snapCam = true
+}
 
-  const playerRef = useRef();
-  const remoteRef = useRef();
-  const aiRefs = [useRef(), useRef(), useRef()];
-
-  // Internal 60fps physics state (never triggers React renders)
-  const phys = useRef({
-    speed: 0,
-    heading: 0,
-    steerAngle: 0,
-    slipAngle: 0,
-    driftDir: 0,
-    driftCharge: 0,
-    boostTimer: 0,
-    lap: 1,
-    lastU: 0,
-    lastSampleIdx: 0,
-    camHeading: 0,
-    camPitch: 0,
-    lastBeepSec: 4,
-    lastNetSend: 0,
-    aiState: AI_CONFIGS.map((cfg, i) => ({
-      u: 0.008 + i * 0.008,
-      lap: 1,
-      speed: 0,
-      laneOffset: cfg.lane,
-      targetLane: cfg.lane,
-      laneTimer: 2 + i,
-      skill: cfg.skill,
-    })),
-  });
-
-  // Keyboard Listeners
-  useEffect(() => {
-    const onKeyDown = (e) => {
-      if (sfx?.init) sfx.init();
-      if (e.code === 'KeyW' || e.code === 'ArrowUp') controls.gas = true;
-      if (e.code === 'KeyS' || e.code === 'ArrowDown') controls.brake = true;
-      if (e.code === 'KeyA' || e.code === 'ArrowLeft') controls.left = true;
-      if (e.code === 'KeyD' || e.code === 'ArrowRight') controls.right = true;
-      if (e.code === 'Space') controls.drift = true;
-      if (e.code === 'KeyC') useGameStore.getState().cycleCamera();
-      if (e.code === 'KeyR') useGameStore.getState().triggerReset();
-    };
-    const onKeyUp = (e) => {
-      if (e.code === 'KeyW' || e.code === 'ArrowUp') controls.gas = false;
-      if (e.code === 'KeyS' || e.code === 'ArrowDown') controls.brake = false;
-      if (e.code === 'KeyA' || e.code === 'ArrowLeft') controls.left = false;
-      if (e.code === 'KeyD' || e.code === 'ArrowRight') controls.right = false;
-      if (e.code === 'Space') controls.drift = false;
-    };
-    window.addEventListener('keydown', onKeyDown);
-    window.addEventListener('keyup', onKeyUp);
-    return () => {
-      window.removeEventListener('keydown', onKeyDown);
-      window.removeEventListener('keyup', onKeyUp);
-    };
-  }, []);
-
-  // Reset Kart & Grid Positions on Race Start or 'R' key
-  const resetKartPositions = (fullRaceReset = false) => {
-    const p = phys.current;
-    const startSample = trackSamples[0];
-    const gridOffset = netRole === 'client' ? 2.4 : -2.4;
-
-    if (playerRef.current) {
-      playerRef.current.position
-        .copy(startSample.pt)
-        .addScaledVector(startSample.binormal, gridOffset);
-    }
-
-    p.heading = Math.atan2(startSample.tangent.x, startSample.tangent.z);
-    p.camHeading = p.heading;
-    p.speed = 0;
-    p.steerAngle = 0;
-    p.slipAngle = 0;
-    p.driftDir = 0;
-    p.driftCharge = 0;
-    p.boostTimer = 0;
-    p.lastSampleIdx = 0;
-
-    if (fullRaceReset) {
-      p.lap = 1;
-      p.lastU = 0;
-      p.lastBeepSec = 4;
-      telemetry.lap = 1;
-      telemetry.raceTime = 0;
-      telemetry.countdown = 3.5;
-
-      p.aiState.forEach((bot, idx) => {
-        bot.u = 0.008 + idx * 0.008;
-        bot.lap = 1;
-        bot.speed = 0;
-        bot.laneOffset = AI_CONFIGS[idx].lane;
-        const pt = trackCurve.getPointAt(bot.u);
-        const tan = trackCurve.getTangentAt(bot.u).normalize();
-        _binormal.crossVectors(tan, _up).normalize();
-        if (aiRefs[idx].current) {
-          aiRefs[idx].current.position.copy(pt).addScaledVector(_binormal, bot.laneOffset);
-          aiRefs[idx].current.rotation.y = Math.atan2(tan.x, tan.z);
-        }
-      });
-    }
-  };
-
-  useEffect(() => {
-    if (phase === 'countdown') resetKartPositions(true);
-  }, [phase]);
-
-  useEffect(() => {
-    if (resetTrigger > 0) resetKartPositions(false);
-  }, [resetTrigger]);
-
-  // Frame-rate independent exponential damping helper
-  const damp = (current, target, lambda, dt) =>
-    THREE.MathUtils.lerp(current, target, 1 - Math.exp(-lambda * dt));
-
-  useFrame((_, rawDelta) => {
-    const dt = Math.min(rawDelta, 0.05);
-    const p = phys.current;
-    const kRoot = playerRef.current;
-    if (!kRoot) return;
-
-    // 1. COUNTDOWN & RACE CLOCK
-    if (phase === 'countdown') {
-      telemetry.countdown -= dt;
-      const sec = Math.ceil(telemetry.countdown);
-      if (sec < p.lastBeepSec && sec >= 1) {
-        p.lastBeepSec = sec;
-        sfx?.playTone?.(440, 0.16, 'square', 0.12);
+function placeBots() {
+  const aiCount = useGameStore.getState().aiCount
+  for (let i = 0; i < PALETTE.bots.length; i++) {
+    const bot = handles.bots[i]
+    if (!bot?.root) continue
+    const def = PALETTE.bots[i]
+    if (!bot.sim) {
+      bot.sim = {
+        u: 0.008 + i * 0.008,
+        lap: 1,
+        speed: 0,
+        laneOffset: def.lane,
+        targetLane: def.lane,
+        laneTimer: 2 + i,
+        skill: def.skill,
       }
-      if (telemetry.countdown <= 0) {
-        sfx?.playTone?.(880, 0.35, 'sawtooth', 0.15);
-        setPhase('racing');
+    }
+    const active = i < aiCount
+    bot.root.visible = active
+    bot.sim.u = 0.008 + i * 0.008
+    bot.sim.lap = 1
+    bot.sim.speed = 0
+    bot.sim.laneOffset = def.lane
+    bot.sim.targetLane = def.lane
+    bot.sim.laneTimer = 2 + i
+    const yaw = writePose(bot.sim.u, bot.sim.laneOffset, bot.root.position)
+    bot.root.rotation.y = yaw
+    if (bot.visual) {
+      bot.visual.rotation.x = slopeFromTangentY(poseTangent.y)
+      bot.visual.rotation.z = 0
+    }
+  }
+}
+
+function beginCountdown() {
+  soundEngine.init()
+  soundEngine.resetGear()
+  telemetry.lap = 1
+  telemetry.lastU = 0
+  telemetry.progress = 1
+  sim.raceTime = 0
+  sim.countdown = 3.5
+  sim.lastBeepSec = 4
+  sim.gantryGo = false
+  sim.lastKmh = -1
+  sim.lastTenth = -1
+  resetPlayer()
+  placeBots()
+  useGameStore.setState({
+    phase: 'countdown',
+    currentLap: 1,
+    playerRank: 1,
+    finishHeadline: 'DESK RACER — LAN & SOLO',
+    finishDetail: 'Race solo against fast AI or connect 2 devices over Wi-Fi',
+  })
+  const banner = handles.bannerEl
+  if (banner) {
+    banner.style.opacity = '1'
+    banner.style.color = '#ffffff'
+    banner.textContent = '3'
+  }
+}
+
+function paintGantry(countdown, go) {
+  const mats = handles.gantry
+  if (!mats?.length) return
+  if (go) {
+    for (let i = 0; i < mats.length; i++) {
+      if (mats[i].userData.hex !== 0x00ff66) {
+        mats[i].userData.hex = 0x00ff66
+        mats[i].color.setHex(0x00ff66)
+      }
+    }
+    if (handles.gantryLight) {
+      handles.gantryLight.color.setHex(0x00ff88)
+      handles.gantryLight.intensity = 14
+    }
+    return
+  }
+  const lit = Math.min(5, Math.floor((3.5 - countdown) * 1.6))
+  for (let i = 0; i < mats.length; i++) {
+    const hex = i < lit ? 0xff1e1e : 0x250000
+    if (mats[i].userData.hex !== hex) {
+      mats[i].userData.hex = hex
+      mats[i].color.setHex(hex)
+    }
+  }
+  if (handles.gantryLight) {
+    handles.gantryLight.color.setHex(0xff3b3b)
+    handles.gantryLight.intensity = lit * 3
+  }
+}
+
+function dropSkid(root, yaw, colorHex) {
+  const mesh = handles.skid
+  if (!mesh || !root) return
+  for (let side = 0; side < 2; side++) {
+    const lateral = REAR_LATERAL[side]
+    const sin = Math.sin(yaw)
+    const cos = Math.cos(yaw)
+    skidWorld.set(
+      root.position.x + lateral * cos + -1.12 * sin,
+      root.position.y + 0.04,
+      root.position.z + -lateral * sin + -1.12 * cos,
+    )
+    skidDummy.position.copy(skidWorld)
+    skidDummy.rotation.set(0, yaw, 0)
+    skidDummy.scale.set(1, 1, 1)
+    skidDummy.updateMatrix()
+    const index = sim.skidCursor % 48
+    sim.skidCursor += 1
+    mesh.setMatrixAt(index, skidDummy.matrix)
+    skidColor.setHex(colorHex)
+    mesh.setColorAt(index, skidColor)
+  }
+  mesh.instanceMatrix.needsUpdate = true
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+}
+
+let mapCtx = null
+
+function drawMinimap() {
+  const canvas = handles.minimap
+  const player = handles.player
+  if (!canvas || !player?.root) return
+  if (!mapCtx || mapCtx.canvas !== canvas) mapCtx = canvas.getContext('2d')
+  const ctx = mapCtx
+  const width = canvas.width
+  const height = canvas.height
+  ctx.clearRect(0, 0, width, height)
+  ctx.beginPath()
+  for (let i = 0; i < miniPts.length; i++) {
+    const p = miniPts[i].pt
+    const px = 44 + (p.x + 20) * 1.12
+    const pz = 78 - p.z * 0.46
+    if (i === 0) ctx.moveTo(px, pz)
+    else ctx.lineTo(px, pz)
+  }
+  ctx.closePath()
+  ctx.strokeStyle = '#101216'
+  ctx.lineWidth = 9
+  ctx.lineJoin = 'round'
+  ctx.stroke()
+  ctx.strokeStyle = '#e8f0f8'
+  ctx.lineWidth = 4.5
+  ctx.stroke()
+
+  const state = useGameStore.getState()
+  for (let i = 0; i < handles.bots.length; i++) {
+    const bot = handles.bots[i]
+    if (!bot?.root?.visible) continue
+    ctx.fillStyle = PALETTE.bots[i].body
+    ctx.beginPath()
+    ctx.arc(44 + (bot.root.position.x + 20) * 1.12, 78 - bot.root.position.z * 0.46, 3.8, 0, Math.PI * 2)
+    ctx.fill()
+  }
+
+  if (state.netConnected && handles.remote?.root) {
+    ctx.fillStyle = state.netRole === 'client' ? '#e6241b' : '#00e5ff'
+    ctx.beginPath()
+    ctx.arc(44 + (handles.remote.root.position.x + 20) * 1.12, 78 - handles.remote.root.position.z * 0.46, 5, 0, Math.PI * 2)
+    ctx.fill()
+  }
+
+  ctx.fillStyle = state.netRole === 'client' ? '#00e5ff' : '#e6241b'
+  ctx.beginPath()
+  ctx.arc(44 + (player.root.position.x + 20) * 1.12, 78 - player.root.position.z * 0.46, 5.6, 0, Math.PI * 2)
+  ctx.fill()
+}
+
+function updateHud(phase) {
+  const speedEl = handles.speedEl
+  const kmh = (Math.abs(telemetry.speed) * 3.1) | 0
+  if (speedEl && kmh !== sim.lastKmh) {
+    sim.lastKmh = kmh
+    speedEl.textContent = String(kmh)
+  }
+
+  const driftEl = handles.driftEl
+  if (driftEl) {
+    const width = Math.min(100, (telemetry.driftCharge / 1.5) * 100)
+    const spark = sparkHex(telemetry.driftCharge, telemetry.boostTimer > 0)
+    if (Math.abs(width - sim.lastDriftWidth) > 0.4) {
+      sim.lastDriftWidth = width
+      driftEl.style.width = `${width}%`
+    }
+    if (spark !== sim.lastSpark) {
+      sim.lastSpark = spark
+      driftEl.style.background = `#${spark.toString(16).padStart(6, '0')}`
+    }
+  }
+
+  const timeEl = handles.timeEl
+  if (timeEl && phase === 'racing') {
+    const tenth = (sim.raceTime * 10) | 0
+    if (tenth !== sim.lastTenth) {
+      sim.lastTenth = tenth
+      timeEl.textContent = fmtTime(sim.raceTime)
+    }
+  }
+}
+
+export function RaceController() {
+  const camera = useThree((s) => s.camera)
+
+  useLayoutEffect(() => {
+    handles.camera = camera
+    resetPlayer()
+    placeBots()
+  }, [camera])
+
+  useFrame((_, rawDt) => {
+    if (intents.start && handles.player?.root) {
+      intents.start = false
+      beginCountdown()
+    }
+    if (intents.reset && handles.player?.root) {
+      intents.reset = false
+      resetPlayer()
+    }
+
+    const dt = Math.min(rawDt, 0.08)
+    const nowMs = performance.now()
+    let phase = useGameStore.getState().phase
+    const player = handles.player
+    if (!player?.root) return
+
+    const banner = handles.bannerEl
+    if (phase === 'countdown') {
+      sim.countdown -= dt
+      const sec = Math.ceil(sim.countdown)
+      if (sec < sim.lastBeepSec && sec >= 1) {
+        sim.lastBeepSec = sec
+        soundEngine.playTone(440, 0.18, 'square', 0.12)
+      }
+      paintGantry(sim.countdown, false)
+      if (sim.countdown > 0.35) {
+        if (banner) {
+          banner.textContent = String(Math.min(3, Math.max(1, sec)))
+          banner.style.opacity = '1'
+          banner.style.color = '#ffffff'
+        }
+      } else if (!sim.gantryGo) {
+        sim.gantryGo = true
+        if (banner) {
+          banner.textContent = 'GO!'
+          banner.style.color = '#00ffcc'
+          banner.style.opacity = '1'
+        }
+        paintGantry(0, true)
+        soundEngine.playTone(880, 0.38, 'sawtooth', 0.15)
+        phase = 'racing'
+        useGameStore.setState({ phase: 'racing' })
       }
     } else if (phase === 'racing') {
-      telemetry.raceTime += dt;
+      sim.raceTime += dt
+      if (banner && sim.raceTime > 0.85 && banner.style.opacity !== '0') banner.style.opacity = '0'
+      if (handles.gantryLight && handles.gantryLight.intensity > 0.7) {
+        handles.gantryLight.intensity = THREE.MathUtils.lerp(handles.gantryLight.intensity, 0.55, frameAlpha(0.04, dt))
+      }
     }
 
-    // 2. SMOOTH ANALOG-LIKE STEERING & DRIFT PHYSICS
-    const canDrive = phase === 'racing';
-    const rawSteer = (controls.left ? 1 : 0) - (controls.right ? 1 : 0);
-    // Smooth steering input so tapping keys doesn't jerk the car
-    p.steerAngle = damp(p.steerAngle, rawSteer, 14, dt);
+    const canDrive = phase === 'racing'
+    const steer = (inputState.kLeft ? 1 : 0) - (inputState.kRight ? 1 : 0)
+    telemetry.steer = steer
 
-    if (p.boostTimer > 0) p.boostTimer = Math.max(0, p.boostTimer - dt);
-    const maxSpd = p.boostTimer > 0 ? BASE_MAX_SPEED * 1.24 : BASE_MAX_SPEED;
-    const accel = p.boostTimer > 0 ? 56 : 35;
+    if (telemetry.boostTimer > 0) telemetry.boostTimer = Math.max(0, telemetry.boostTimer - dt)
+    const activeMax = telemetry.boostTimer > 0 ? BASE_MAX_SPEED * 1.24 : BASE_MAX_SPEED
+    const accel = telemetry.boostTimer > 0 ? 55 : 34
 
-    if (canDrive && controls.gas) {
-      p.speed += accel * dt;
-    } else if (canDrive && controls.brake) {
-      p.speed -= 40 * dt;
-    } else {
-      p.speed = damp(p.speed, 0, 1.4, dt);
-    }
-    p.speed = THREE.MathUtils.clamp(p.speed, -16, maxSpd);
+    if (canDrive && inputState.gas) telemetry.speed += accel * dt
+    else if (canDrive && inputState.brake) telemetry.speed -= 38 * dt
+    else telemetry.speed *= Math.pow(0.32, dt)
+    telemetry.speed = THREE.MathUtils.clamp(telemetry.speed, -16, activeMax)
 
-    // Slip-Angle Drifting
-    const wantsDrift = canDrive && controls.drift && p.speed > 20;
+    const wantsDrift = canDrive && inputState.drift && telemetry.speed > 22
     if (wantsDrift) {
-      if (p.driftDir === 0 && Math.abs(p.steerAngle) > 0.12) {
-        p.driftDir = Math.sign(p.steerAngle);
-      }
-      if (p.driftDir !== 0) {
-        const driftTurn = 1.9 * p.driftDir + p.steerAngle * 0.95;
-        p.heading += driftTurn * dt;
-        const targetSlip = p.driftDir * 0.45 + p.steerAngle * 0.15;
-        p.slipAngle = damp(p.slipAngle, targetSlip, 10, dt);
-        p.driftCharge = Math.min(2.0, p.driftCharge + dt);
-      } else if (Math.abs(p.speed) > 0.4) {
-        p.heading += p.steerAngle * 2.15 * dt * Math.sign(p.speed);
+      if (telemetry.driftDir === 0 && Math.abs(steer) > 0.15) telemetry.driftDir = Math.sign(steer)
+      if (telemetry.driftDir !== 0) {
+        const driftTurn = 1.95 * telemetry.driftDir + steer * 0.95
+        telemetry.heading += driftTurn * dt
+        const targetSlip = telemetry.driftDir * 0.46 + steer * 0.14
+        telemetry.slip = THREE.MathUtils.lerp(telemetry.slip, targetSlip, frameAlpha(0.15, dt))
+        telemetry.driftCharge = Math.min(2.2, telemetry.driftCharge + dt)
+      } else if (Math.abs(telemetry.speed) > 0.4) {
+        telemetry.heading += steer * 2.15 * dt * Math.sign(telemetry.speed)
       }
     } else {
-      if (p.driftDir !== 0 && p.driftCharge >= 0.5) {
-        p.boostTimer = p.driftCharge > 1.3 ? 1.15 : 0.65;
-        p.speed = Math.min(BASE_MAX_SPEED * 1.24, p.speed + 14);
-        sfx?.playBoost?.();
+      if (telemetry.driftDir !== 0 && telemetry.driftCharge >= 0.55) {
+        const boostStrength = telemetry.driftCharge > 1.4 ? 1.15 : 0.65
+        telemetry.boostTimer = boostStrength
+        telemetry.speed = Math.min(BASE_MAX_SPEED * 1.24, telemetry.speed + 14)
+        soundEngine.playBoost()
       }
-      p.driftDir = 0;
-      p.driftCharge = 0;
-      p.slipAngle = damp(p.slipAngle, 0, 12, dt);
-
-      if (Math.abs(p.speed) > 0.4) {
-        const highSpeedStability = THREE.MathUtils.lerp(1.0, 0.7, Math.abs(p.speed) / BASE_MAX_SPEED);
-        p.heading += p.steerAngle * 2.3 * highSpeedStability * dt * Math.sign(p.speed);
-      }
-    }
-
-    // Advance Position along Velocity Vector
-    kRoot.position.x += Math.sin(p.heading) * p.speed * dt;
-    kRoot.position.z += Math.cos(p.heading) * p.speed * dt;
-
-    // 3. FAST O(1) SPLINE TRACKING, CURB VIBRATION & SMOOTH WALL GLIDE
-    const { sample: closest, distSq, index: foundIdx } = findClosestTrackSample(
-      kRoot.position.x,
-      kRoot.position.z,
-      p.lastSampleIdx
-    );
-    p.lastSampleIdx = foundIdx;
-
-    const distFromCenter = Math.sqrt(distSq);
-    const curbZone = TRACK_WIDTH * 0.5 - 2.2;
-    const wallLimit = TRACK_WIDTH * 0.5 - 0.95;
-    const onCurb = distFromCenter > curbZone;
-
-    const curbBuzz = onCurb && Math.abs(p.speed) > 8 ? Math.sin(performance.now() * 0.08) * 0.045 : 0;
-    kRoot.position.y = damp(kRoot.position.y, closest.pt.y, 18, dt) + curbBuzz;
-
-    if (distFromCenter > wallLimit) {
-      const dx = (kRoot.position.x - closest.pt.x) / distFromCenter;
-      const dz = (kRoot.position.z - closest.pt.z) / distFromCenter;
-      kRoot.position.x = closest.pt.x + dx * wallLimit;
-      kRoot.position.z = closest.pt.z + dz * wallLimit;
-
-      const trackYaw = Math.atan2(closest.tangent.x, closest.tangent.z);
-      const angleDiff = Math.atan2(Math.sin(trackYaw - p.heading), Math.cos(trackYaw - p.heading));
-      p.heading += angleDiff * 0.35;
-      p.speed *= 1 - 0.3 * dt;
-    }
-
-    // Visual Orientation & Pitch
-    const slopePitch = -Math.asin(THREE.MathUtils.clamp(closest.tangent.y, -0.5, 0.5));
-    kRoot.rotation.y = p.heading + p.slipAngle;
-    kRoot.rotation.x = damp(kRoot.rotation.x, slopePitch, 12, dt);
-    const targetRoll = (-p.steerAngle * 0.06 - p.slipAngle * 0.14) * (p.speed / BASE_MAX_SPEED);
-    kRoot.rotation.z = damp(kRoot.rotation.z, targetRoll, 12, dt);
-
-    // Update Sound Engine
-    if (useGameStore.getState().soundEnabled) {
-      sfx?.update?.(p.speed, BASE_MAX_SPEED, p.driftDir !== 0, onCurb, canDrive);
-    }
-
-    // 4. LAP COUNTER & FINISH CHECK
-    if (p.lastU > 0.88 && closest.u < 0.12 && p.speed > 0) {
-      p.lap += 1;
-      telemetry.lap = p.lap;
-      sfx?.playTone?.(660, 0.22, 'triangle', 0.14);
-      if (p.lap > laps) {
-        setPhase('finished');
+      telemetry.driftDir = 0
+      telemetry.driftCharge = 0
+      telemetry.slip = THREE.MathUtils.lerp(telemetry.slip, 0, frameAlpha(0.2, dt))
+      if (Math.abs(telemetry.speed) > 0.4) {
+        const speedFactor = THREE.MathUtils.lerp(1, 0.72, Math.abs(telemetry.speed) / BASE_MAX_SPEED)
+        telemetry.heading += steer * 2.3 * speedFactor * dt * Math.sign(telemetry.speed)
       }
     }
-    p.lastU = closest.u;
-    const playerProgress = p.lap + closest.u;
 
-    // 5. AI BOTS UPDATE
-    let rank = 1;
-    let totalRacers = 1;
+    player.root.position.x += Math.sin(telemetry.heading) * telemetry.speed * dt
+    player.root.position.z += Math.cos(telemetry.heading) * telemetry.speed * dt
 
-    p.aiState.forEach((bot, idx) => {
-      const active = idx < aiCount;
-      telemetry.aiPositions[idx].active = active;
-      const botMesh = aiRefs[idx].current;
-      if (!active || !botMesh) return;
-      totalRacers++;
+    const hit = closestSampleIndex(player.root.position.x, player.root.position.z, sim.hint)
+    sim.hint = hit.index
+    const closest = trackSamples[hit.index]
+    const distFromCenter = Math.sqrt(hit.distSq)
+    const onCurb = distFromCenter > CURB_START
+    telemetry.onCurb = onCurb
+    telemetry.u = closest.u
+    const curbBuzz = onCurb && Math.abs(telemetry.speed) > 8 ? Math.sin(nowMs * 0.085) * 0.055 : 0
+    player.root.position.y = THREE.MathUtils.lerp(player.root.position.y, closest.pt.y, frameAlpha(0.4, dt)) + curbBuzz
 
-      if (canDrive) {
-        const sIdx = Math.floor(bot.u * TRACK_SEGMENTS) % TRACK_SEGMENTS;
-        const s = trackSamples[sIdx];
-        const cornerFactor = Math.max(0.76, 1.0 - s.curvature * 2.3);
-        const gap = playerProgress - (bot.lap + bot.u);
-        const rubber = THREE.MathUtils.clamp(1.0 + gap * 0.2, 0.92, 1.12);
+    if (distFromCenter > WALL_LIMIT) {
+      pull.set(player.root.position.x - closest.pt.x, player.root.position.z - closest.pt.z)
+      if (pull.lengthSq() > 1e-8) pull.normalize()
+      player.root.position.x = closest.pt.x + pull.x * WALL_LIMIT
+      player.root.position.z = closest.pt.z + pull.y * WALL_LIMIT
+      const trackYaw = Math.atan2(closest.tangent.x, closest.tangent.z)
+      const angleDiff = Math.atan2(Math.sin(trackYaw - telemetry.heading), Math.cos(trackYaw - telemetry.heading))
+      telemetry.heading += angleDiff * frameAlpha(0.35, dt)
+      telemetry.speed *= 1 - 0.35 * dt
+    }
 
-        const targetSpd = BASE_MAX_SPEED * bot.skill * aiDifficulty * cornerFactor * rubber;
-        bot.speed = damp(bot.speed, targetSpd, 3, dt);
+    player.root.rotation.y = telemetry.heading + telemetry.slip
+    const slopePitch = slopeFromTangentY(closest.tangent.y)
+    updateKart(player, {
+      speed: telemetry.speed,
+      dt,
+      steer,
+      slopePitch,
+      slip: telemetry.slip,
+      driftCharge: telemetry.driftCharge,
+      boostTimer: telemetry.boostTimer,
+    })
 
-        const prevU = bot.u;
-        bot.u = (bot.u + (bot.speed * dt) / TOTAL_TRACK_LENGTH) % 1;
-        if (prevU > 0.88 && bot.u < 0.12) bot.lap++;
+    if (telemetry.driftDir !== 0 && telemetry.speed > 22) {
+      sim.skidAccum += dt
+      const spark = sparkHex(telemetry.driftCharge, telemetry.boostTimer > 0)
+      while (sim.skidAccum > 0.045) {
+        sim.skidAccum -= 0.045
+        dropSkid(player.root, telemetry.heading + telemetry.slip, spark)
+      }
+    } else {
+      sim.skidAccum = 0
+    }
 
-        bot.laneTimer -= dt;
-        if (bot.laneTimer <= 0) {
-          bot.laneTimer = 2.5 + Math.random() * 2.5;
-          bot.targetLane = (Math.random() - 0.5) * (TRACK_WIDTH - 4.5);
+    soundEngine.update(telemetry.speed, BASE_MAX_SPEED, telemetry.driftDir !== 0, onCurb, canDrive)
+
+    let finishedThisFrame = false
+    if (canDrive && telemetry.lastU > 0.88 && closest.u < 0.12 && telemetry.speed > 0) {
+      telemetry.lap += 1
+      soundEngine.playTone(660, 0.25, 'triangle', 0.14)
+      const laps = useGameStore.getState().laps
+      if (telemetry.lap > laps) finishedThisFrame = true
+      else useGameStore.setState({ currentLap: telemetry.lap })
+    }
+    telemetry.lastU = closest.u
+    telemetry.progress = telemetry.lap + closest.u
+
+    const settings = useGameStore.getState()
+    let playerRank = 1
+    let totalRacers = 1
+    if (canDrive) {
+      for (let i = 0; i < handles.bots.length; i++) {
+        const bot = handles.bots[i]
+        if (!bot?.root || !bot.sim || i >= settings.aiCount) continue
+        totalRacers += 1
+        const sampleIndex = Math.floor(bot.sim.u * trackSamples.length) % trackSamples.length
+        const sample = trackSamples[sampleIndex]
+        const cornerSlowdown = Math.max(0.76, 1 - sample.curvature * 2.4)
+        const progressGap = telemetry.progress - (bot.sim.lap + bot.sim.u)
+        const rubberBand = THREE.MathUtils.clamp(1 + progressGap * 0.22, 0.91, 1.12)
+        const targetSpeed = BASE_MAX_SPEED * bot.sim.skill * settings.aiDifficulty * cornerSlowdown * rubberBand
+        bot.sim.speed = THREE.MathUtils.lerp(bot.sim.speed, targetSpeed, dt * 2.5)
+        const prevU = bot.sim.u
+        bot.sim.u = (bot.sim.u + (bot.sim.speed * dt) / TRACK_LENGTH) % 1
+        if (prevU > 0.88 && bot.sim.u < 0.12) bot.sim.lap += 1
+        bot.sim.laneTimer -= dt
+        if (bot.sim.laneTimer <= 0) {
+          bot.sim.laneTimer = 2.5 + Math.random() * 3
+          bot.sim.targetLane = (Math.random() - 0.5) * (TRACK_WIDTH - 4.5)
         }
-        bot.laneOffset = damp(bot.laneOffset, bot.targetLane, 2, dt);
-
-        const pt = trackCurve.getPointAt(bot.u);
-        const tan = trackCurve.getTangentAt(bot.u).normalize();
-        _binormal.crossVectors(tan, _up).normalize();
-
-        botMesh.position.copy(pt).addScaledVector(_binormal, bot.laneOffset);
-        botMesh.rotation.y = Math.atan2(tan.x, tan.z);
-
-        telemetry.aiPositions[idx].x = botMesh.position.x;
-        telemetry.aiPositions[idx].z = botMesh.position.z;
+        bot.sim.laneOffset = THREE.MathUtils.lerp(bot.sim.laneOffset, bot.sim.targetLane, dt * 1.8)
+        const yaw = writePose(bot.sim.u, bot.sim.laneOffset, bot.root.position)
+        bot.root.rotation.y = yaw
+        updateKart(bot, {
+          speed: bot.sim.speed,
+          dt,
+          steer: 0,
+          slopePitch: slopeFromTangentY(poseTangent.y),
+          slip: 0,
+          driftCharge: 0,
+          boostTimer: 0,
+        })
+        if (bot.sim.lap + bot.sim.u > telemetry.progress) playerRank += 1
       }
-
-      if (bot.lap + bot.u > playerProgress) rank++;
-    });
-
-    // 6. LAN P2P SYNC
-    if (peerConnected && remoteRef.current) {
-      totalRacers++;
-      const now = performance.now();
-      if (now - p.lastNetSend > 33 && sendTelemetry) {
-        p.lastNetSend = now;
-        sendTelemetry({
-          x: kRoot.position.x,
-          y: kRoot.position.y,
-          z: kRoot.position.z,
-          heading: p.heading,
-          slip: p.slipAngle,
-          speed: p.speed,
-          lap: p.lap,
-          u: closest.u,
-          boost: p.boostTimer > 0 ? 1 : 0,
-        });
-      }
-      const rt = telemetry.remotePos;
-      _remoteVec.set(rt.x, rt.y, rt.z);
-      remoteRef.current.position.lerp(_remoteVec, 1 - Math.exp(-15 * dt));
-      remoteRef.current.rotation.y = rt.heading + rt.slip;
-      if (rt.lap + rt.u > playerProgress) rank++;
+    } else {
+      totalRacers += Math.min(settings.aiCount, handles.bots.length)
     }
 
-    // Write 60fps Telemetry for HUD & Minimap (Zero React state updates!)
-    telemetry.speed = p.speed;
-    telemetry.driftCharge = p.driftCharge;
-    telemetry.boostTimer = p.boostTimer;
-    telemetry.u = closest.u;
-    telemetry.rank = rank;
-    telemetry.totalRacers = totalRacers;
-    telemetry.playerPos.x = kRoot.position.x;
-    telemetry.playerPos.y = kRoot.position.y;
-    telemetry.playerPos.z = kRoot.position.z;
+    if (!netBridge.connected && handles.remote) handles.remote.seen = false
+    if (netBridge.connected && handles.remote?.root) {
+      totalRacers += 1
+      sendTelemetry({
+        x: player.root.position.x,
+        y: player.root.position.y,
+        z: player.root.position.z,
+        heading: telemetry.heading,
+        slip: telemetry.slip,
+        speed: telemetry.speed,
+        lap: telemetry.lap,
+        u: closest.u,
+        boost: telemetry.boostTimer > 0 ? 1 : 0,
+      })
+      remoteVec.set(remoteTarget.x, remoteTarget.y, remoteTarget.z)
+      if (!handles.remote.seen) {
+        handles.remote.root.position.copy(remoteVec)
+        handles.remote.root.rotation.y = remoteTarget.heading + remoteTarget.slip
+        handles.remote.seen = true
+      } else {
+        handles.remote.root.position.lerp(remoteVec, frameAlpha(0.3, dt))
+      }
+      const targetYaw = remoteTarget.heading + remoteTarget.slip
+      const yawDelta = Math.atan2(
+        Math.sin(targetYaw - handles.remote.root.rotation.y),
+        Math.cos(targetYaw - handles.remote.root.rotation.y),
+      )
+      handles.remote.root.rotation.y += yawDelta * frameAlpha(0.45, dt)
+      const remoteHit = closestSampleIndex(handles.remote.root.position.x, handles.remote.root.position.z, sim.remoteHint)
+      sim.remoteHint = remoteHit.index
+      updateKart(handles.remote, {
+        speed: remoteTarget.speed,
+        dt,
+        steer: 0,
+        slopePitch: slopeFromTangentY(trackSamples[remoteHit.index].tangent.y),
+        slip: remoteTarget.slip,
+        driftCharge: remoteTarget.boost ? 1.5 : 0,
+        boostTimer: remoteTarget.boost ? 0.4 : 0,
+      })
+      if (remoteTarget.lap + remoteTarget.u > telemetry.progress) playerRank += 1
+    }
 
-    // 7. BUTTER-SMOOTH EXPONENTIAL SPRING CAMERA RIG
-    const camPresets = [
-      { dist: 7.4, height: 2.85, lookDist: 11.0, lookY: 1.15, stiff: 11.0 },
-      { dist: 5.2, height: 1.95, lookDist: 14.0, lookY: 0.95, stiff: 15.0 },
-      { dist: 11.8, height: 5.0, lookDist: 9.0, lookY: 1.4, stiff: 9.0 },
-      { dist: -0.4, height: 1.38, lookDist: 20.0, lookY: 1.1, stiff: 30.0 },
-    ];
-    const cm = camPresets[camIndex] || camPresets[0];
+    const store = useGameStore.getState()
+    if (store.playerRank !== playerRank || store.totalRacers !== totalRacers) {
+      useGameStore.setState({ playerRank, totalRacers })
+    }
 
-    const angleDiff = Math.atan2(Math.sin(p.heading - p.camHeading), Math.cos(p.heading - p.camHeading));
-    p.camHeading += angleDiff * (1 - Math.exp(-cm.stiff * dt));
-    p.camPitch = damp(p.camPitch, slopePitch, 7, dt);
+    if (finishedThisFrame) {
+      phase = 'finished'
+      const ord = ['st', 'nd', 'rd', 'th']
+      const placed = `${playerRank}${ord[playerRank - 1] || 'th'} / ${totalRacers}`
+      useGameStore.setState({
+        phase: 'finished',
+        currentLap: store.laps,
+        playerRank,
+        totalRacers,
+        finishHeadline: 'FINISHED!',
+        finishDetail: `Time: ${fmtTime(sim.raceTime)} • Placed ${placed}`,
+      })
+    }
 
-    const targetFov = p.boostTimer > 0 ? 68 : 60;
+    updateHud(phase)
+
+    const cm = CAM_MODES[useGameStore.getState().camIndex] || CAM_MODES[0]
+    const diffAngle = Math.atan2(
+      Math.sin(telemetry.heading - sim.camHeading),
+      Math.cos(telemetry.heading - sim.camHeading),
+    )
+    sim.camHeading += diffAngle * Math.min(1, dt * cm.stiff)
+    sim.camPitch = THREE.MathUtils.lerp(sim.camPitch, slopePitch, Math.min(1, dt * 6))
+
+    const targetFov = telemetry.boostTimer > 0 ? 70 : 60
     if (Math.abs(camera.fov - targetFov) > 0.1) {
-      camera.fov = damp(camera.fov, targetFov, 8, dt);
-      camera.updateProjectionMatrix();
+      camera.fov = THREE.MathUtils.lerp(camera.fov, targetFov, Math.min(1, dt * 8))
+      camera.updateProjectionMatrix()
     }
 
-    _camDesired.set(
-      kRoot.position.x - Math.sin(p.camHeading) * cm.dist,
-      kRoot.position.y + cm.height + Math.sin(p.camPitch) * 2.0,
-      kRoot.position.z - Math.cos(p.camHeading) * cm.dist
-    );
-    camera.position.lerp(_camDesired, 1 - Math.exp(-cm.stiff * 1.6 * dt));
+    const headSin = Math.sin(sim.camHeading)
+    const headCos = Math.cos(sim.camHeading)
+    const side = cm.side || 0
+    camDesired.set(
+      player.root.position.x - headSin * cm.dist + headCos * side,
+      player.root.position.y + cm.height + Math.sin(sim.camPitch) * 1.4,
+      player.root.position.z - headCos * cm.dist - headSin * side,
+    )
+    const sun = handles.keyLight
+    if (sun) {
+      sun.position.set(player.root.position.x - 48, player.root.position.y + 96, player.root.position.z - 30)
+      sun.target.position.set(player.root.position.x, player.root.position.y + 0.6, player.root.position.z)
+      sun.target.updateMatrixWorld()
+    }
+    if (sim.snapCam) {
+      camera.position.copy(camDesired)
+      sim.snapCam = false
+    } else {
+      camera.position.lerp(camDesired, Math.min(1, dt * cm.stiff * 1.4))
+    }
 
-    _camLook.set(
-      kRoot.position.x + Math.sin(p.camHeading + p.slipAngle * 0.35) * cm.lookDist,
-      kRoot.position.y + cm.lookY - Math.sin(p.camPitch) * 3.0,
-      kRoot.position.z + Math.cos(p.camHeading + p.slipAngle * 0.35) * cm.lookDist
-    );
-    camera.lookAt(_camLook);
-  });
+    const lookYaw = sim.camHeading + telemetry.slip * 0.35
+    lookTarget.set(
+      player.root.position.x + Math.sin(lookYaw) * cm.lookDist,
+      player.root.position.y + cm.lookY - Math.sin(sim.camPitch) * 3,
+      player.root.position.z + Math.cos(lookYaw) * cm.lookDist,
+    )
+    camera.up.copy(UP)
+    camera.lookAt(lookTarget)
 
-  // Consistent Colors: Host = Red (#e6241b), Client = Cyan (#00e5ff)
-  const localBodyColor = netRole === 'client' ? '#00e5ff' : '#e6241b';
-  const localTrimColor = netRole === 'client' ? '#ffffff' : '#f5d020';
-  const remoteBodyColor = netRole === 'client' ? '#e6241b' : '#00e5ff';
-  const remoteTrimColor = netRole === 'client' ? '#f5d020' : '#ffffff';
+    drawMinimap()
+  })
 
-  return (
-    <>
-      {/* Local Player Kart */}
-      <group ref={playerRef}>
-        <KartModel
-          bodyColor={localBodyColor}
-          trimColor={localTrimColor}
-          isPlayer
-        />
-      </group>
-
-      {/* Remote LAN Player 2 Kart */}
-      <group ref={remoteRef} visible={peerConnected}>
-        <KartModel
-          bodyColor={remoteBodyColor}
-          trimColor={remoteTrimColor}
-        />
-      </group>
-
-      {/* AI Opponent Karts */}
-      {AI_CONFIGS.map((cfg, idx) => (
-        <group key={idx} ref={aiRefs[idx]} visible={idx < aiCount}>
-          <KartModel bodyColor={cfg.bodyColor} trimColor={cfg.trimColor} />
-        </group>
-      ))}
-    </>
-  );
+  return null
 }
